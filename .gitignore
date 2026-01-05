@@ -1,0 +1,16 @@
+# secrets
+.env
+
+# local database
+*.db
+
+# python junk
+__pycache__/
+*.pyc
+
+# virtual envs
+.venv/
+venv/
+
+# IDE
+.idea/
