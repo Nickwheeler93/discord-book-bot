@@ -1,6 +1,6 @@
 import sqlite3
 
-DB_PATH = "books.db"
+DB_PATH = "data/books.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
