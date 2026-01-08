@@ -61,19 +61,16 @@ async def on_member_join(member):
 
 @bot.command()
 async def startbook(ctx, *, title: str):
-    # Make sure the user has a profile row
     ensure_profile(ctx.author)
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # Write to reading_progress (one active book per user)
     cur.execute("""
         INSERT OR REPLACE INTO reading_progress (user_id, book_title, total_pages, current_page)
         VALUES (?, ?, NULL, 0)
     """, (ctx.author.id, title))
 
-    # Update profile summary fields
     cur.execute("""
         UPDATE user_profiles
         SET current_book = ?, current_page = 0, last_active = CURRENT_TIMESTAMP
@@ -83,7 +80,29 @@ async def startbook(ctx, *, title: str):
     conn.commit()
     conn.close()
 
-    await ctx.send(f"📖 Started: **{title}**")
+    await ctx.send(
+        f"📖 Started **{title}**!\n"
+        f"➡️ If you want, reply `!totalpages <number>` to add total page count."
+    )
+
+@bot.command()
+async def totalpages(ctx, total_pages: int):
+    ensure_profile(ctx.author)
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE reading_progress
+        SET total_pages = ?
+        WHERE user_id = ?
+    """, (total_pages, ctx.author.id))
+
+    conn.commit()
+    conn.close()
+
+    await ctx.send(f"📏 Set total pages to **{total_pages}**")
+
 
 @bot.command()
 async def progress(ctx, page: int):
