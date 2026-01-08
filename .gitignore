@@ -1,19 +1,5 @@
-# secrets
 .env
-
-# local database
-*.db
-
-# python junk
+data/
+logs/
 __pycache__/
 *.pyc
-
-# virtual envs
-.venv/
-venv/
-
-# IDE
-.idea/
-
-# logs
-*.log
