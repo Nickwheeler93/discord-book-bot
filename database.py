@@ -1,14 +1,3 @@
-"""
-database.py - SQLite layer for Discord Book Bot (normalized)
-
-Tables:
-- users
-- books
-- user_books (status, progress, timestamps, milestone tracking)
-
-Run init_db() at bot startup.
-"""
-
 from __future__ import annotations
 
 import sqlite3
@@ -18,14 +7,16 @@ from typing import Optional, List, Dict, Any, Tuple
 
 DEFAULT_DB_PATH = "./data/bookbot.db"
 
-ALLOWED_STATUSES = {
-    "plan_to_read",
-    "reading",
-    "finished",
-    "dnf",
-    "paused",
-}
+# Statuses
+STATUS_PLAN = "plan_to_read"
+STATUS_READING = "reading"
+STATUS_FINISHED = "finished"
+STATUS_DNF = "dnf"
+STATUS_PAUSED = "paused"
 
+ALLOWED_STATUSES = {STATUS_PLAN, STATUS_READING, STATUS_FINISHED, STATUS_DNF, STATUS_PAUSED}
+
+# Milestones for congrats
 MILESTONES = [25, 50, 75, 100]
 
 
@@ -102,8 +93,6 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 total_pages     INTEGER,
                 started_at      TEXT,
                 finished_at     TEXT,
-                rating          INTEGER,
-                notes           TEXT,
                 last_milestone  INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
@@ -115,19 +104,13 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         )
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_discord_id ON users(discord_user_id);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_books_title ON books(title);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_books_user ON user_books(user_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_books_status ON user_books(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_books_updated ON user_books(updated_at);")
 
-        # lightweight migrations for older versions
+        # Light migrations
         if _table_exists(conn, "users") and not _column_exists(conn, "users", "goodreads_url"):
             conn.execute("ALTER TABLE users ADD COLUMN goodreads_url TEXT;")
-
-        if _table_exists(conn, "user_books") and not _column_exists(conn, "user_books", "notes"):
-            conn.execute("ALTER TABLE user_books ADD COLUMN notes TEXT;")
-
-        if _table_exists(conn, "user_books") and not _column_exists(conn, "user_books", "rating"):
-            conn.execute("ALTER TABLE user_books ADD COLUMN rating INTEGER;")
 
         if _table_exists(conn, "user_books") and not _column_exists(conn, "user_books", "last_milestone"):
             conn.execute("ALTER TABLE user_books ADD COLUMN last_milestone INTEGER NOT NULL DEFAULT 0;")
@@ -136,48 +119,42 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
 
 
 # --------------------------
-# USERS
+# Users
 # --------------------------
 
 def upsert_user(
     discord_user_id: str,
     display_name: Optional[str] = None,
-    goodreads_url: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
-    created_at = utc_now_iso()
+    now = utc_now_iso()
     with get_conn(db_path) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute(
             """
-            INSERT INTO users (discord_user_id, display_name, goodreads_url, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO users (discord_user_id, display_name, created_at)
+            VALUES (?, ?, ?)
             ON CONFLICT(discord_user_id) DO UPDATE SET
-                display_name  = COALESCE(excluded.display_name, users.display_name),
-                goodreads_url = COALESCE(excluded.goodreads_url, users.goodreads_url);
+                display_name = COALESCE(excluded.display_name, users.display_name);
             """,
-            (discord_user_id, display_name, goodreads_url, created_at),
+            (discord_user_id, display_name, now),
         )
-        row = conn.execute("SELECT id FROM users WHERE discord_user_id = ?;", (discord_user_id,)).fetchone()
+        row = conn.execute("SELECT id FROM users WHERE discord_user_id=?;", (discord_user_id,)).fetchone()
         return int(row["id"])
 
 
 def set_goodreads_url(discord_user_id: str, url: Optional[str], db_path: str = DEFAULT_DB_PATH) -> None:
     with get_conn(db_path) as conn:
-        conn.execute(
-            "UPDATE users SET goodreads_url = ? WHERE discord_user_id = ?;",
-            (url, discord_user_id),
-        )
+        conn.execute("UPDATE users SET goodreads_url=? WHERE discord_user_id=?;", (url, discord_user_id))
 
 
 def get_user(discord_user_id: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
     with get_conn(db_path) as conn:
-        row = conn.execute("SELECT * FROM users WHERE discord_user_id = ?;", (discord_user_id,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE discord_user_id=?;", (discord_user_id,)).fetchone()
         return dict(row) if row else None
 
 
 # --------------------------
-# BOOKS
+# Books
 # --------------------------
 
 def add_or_get_book(
@@ -188,24 +165,25 @@ def add_or_get_book(
     published_year: Optional[int] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
-    now = utc_now_iso()
     title = title.strip()
+    now = utc_now_iso()
 
     with get_conn(db_path) as conn:
         if google_volume_id:
-            row = conn.execute("SELECT id FROM books WHERE google_volume_id = ?;", (google_volume_id,)).fetchone()
+            row = conn.execute("SELECT id FROM books WHERE google_volume_id=?;", (google_volume_id,)).fetchone()
             if row:
                 return int(row["id"])
 
         if isbn13:
-            row = conn.execute("SELECT id FROM books WHERE isbn13 = ?;", (isbn13,)).fetchone()
+            row = conn.execute("SELECT id FROM books WHERE isbn13=?;", (isbn13,)).fetchone()
             if row:
                 return int(row["id"])
 
+        # soft dedupe by title+author
         row = conn.execute(
             """
             SELECT id FROM books
-            WHERE lower(title) = lower(?) AND lower(COALESCE(author,'')) = lower(COALESCE(?, ''));
+            WHERE lower(title)=lower(?) AND lower(COALESCE(author,''))=lower(COALESCE(?, ''));
             """,
             (title, (author or "").strip()),
         ).fetchone()
@@ -222,7 +200,7 @@ def add_or_get_book(
         return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])
 
 
-def search_books(query: str, limit: int = 10, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+def search_books_local(query: str, limit: int = 10, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     q = f"%{query.strip()}%"
     with get_conn(db_path) as conn:
         cur = conn.execute(
@@ -232,21 +210,23 @@ def search_books(query: str, limit: int = 10, db_path: str = DEFAULT_DB_PATH) ->
             ORDER BY title ASC
             LIMIT ?;
             """,
-            (q, q, limit),
+            (q, q, int(limit)),
         )
         return [dict(r) for r in cur.fetchall()]
 
 
 # --------------------------
-# USER_BOOKS
+# User-books
 # --------------------------
 
 def add_book_to_user(
     discord_user_id: str,
     title: str,
     author: Optional[str] = None,
-    status: str = "plan_to_read",
+    status: str = STATUS_READING,
     progress_pct: int = 0,
+    current_page: Optional[int] = None,
+    total_pages: Optional[int] = None,
     google_volume_id: Optional[str] = None,
     isbn13: Optional[str] = None,
     published_year: Optional[int] = None,
@@ -254,9 +234,10 @@ def add_book_to_user(
 ) -> Tuple[int, int, bool]:
     status = status.strip().lower()
     if status not in ALLOWED_STATUSES:
-        raise ValueError(f"Invalid status '{status}'. Allowed: {sorted(ALLOWED_STATUSES)}")
+        raise ValueError(f"Invalid status '{status}'")
 
     progress_pct = max(0, min(100, int(progress_pct)))
+    now = utc_now_iso()
 
     user_id = upsert_user(discord_user_id, db_path=db_path)
     book_id = add_or_get_book(
@@ -268,11 +249,12 @@ def add_book_to_user(
         db_path=db_path,
     )
 
-    now = utc_now_iso()
+    started_at = now if status == STATUS_READING else None
+    finished_at = now if status == STATUS_FINISHED else None
+
     with get_conn(db_path) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
         existing = conn.execute(
-            "SELECT id FROM user_books WHERE user_id = ? AND book_id = ?;",
+            "SELECT id FROM user_books WHERE user_id=? AND book_id=?;",
             (user_id, book_id),
         ).fetchone()
 
@@ -280,21 +262,48 @@ def add_book_to_user(
             conn.execute(
                 """
                 UPDATE user_books
-                SET status = ?,
-                    progress_pct = ?,
-                    updated_at = ?
-                WHERE user_id = ? AND book_id = ?;
+                SET status=?,
+                    progress_pct=?,
+                    current_page=COALESCE(?, current_page),
+                    total_pages=COALESCE(?, total_pages),
+                    started_at=COALESCE(?, started_at),
+                    finished_at=COALESCE(?, finished_at),
+                    updated_at=?
+                WHERE user_id=? AND book_id=?;
                 """,
-                (status, progress_pct, now, user_id, book_id),
+                (
+                    status,
+                    progress_pct,
+                    current_page,
+                    total_pages,
+                    started_at,
+                    finished_at,
+                    now,
+                    user_id,
+                    book_id,
+                ),
             )
             return user_id, book_id, False
 
         conn.execute(
             """
-            INSERT INTO user_books (user_id, book_id, status, progress_pct, created_at, updated_at, started_at, finished_at, last_milestone)
-            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0);
+            INSERT INTO user_books
+              (user_id, book_id, status, progress_pct, current_page, total_pages, started_at, finished_at, last_milestone, created_at, updated_at)
+            VALUES
+              (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?);
             """,
-            (user_id, book_id, status, progress_pct, now, now),
+            (
+                user_id,
+                book_id,
+                status,
+                progress_pct,
+                current_page,
+                total_pages,
+                started_at,
+                finished_at,
+                now,
+                now,
+            ),
         )
         return user_id, book_id, True
 
@@ -312,9 +321,9 @@ def list_user_books(
 
     sql = """
         SELECT
-            ub.user_id, ub.book_id, ub.status, ub.progress_pct, ub.current_page, ub.total_pages,
-            ub.started_at, ub.finished_at, ub.rating, ub.notes, ub.last_milestone, ub.created_at, ub.updated_at,
-            b.title, b.author, b.isbn13, b.published_year, b.google_volume_id
+            ub.book_id, ub.status, ub.progress_pct, ub.current_page, ub.total_pages,
+            ub.started_at, ub.finished_at, ub.last_milestone, ub.updated_at,
+            b.title, b.author, b.published_year
         FROM user_books ub
         JOIN books b ON b.id = ub.book_id
         WHERE ub.user_id = ?
@@ -324,7 +333,7 @@ def list_user_books(
     if status:
         st = status.strip().lower()
         if st not in ALLOWED_STATUSES:
-            raise ValueError(f"Invalid status '{st}'. Allowed: {sorted(ALLOWED_STATUSES)}")
+            raise ValueError(f"Invalid status '{st}'")
         sql += " AND ub.status = ?"
         params.append(st)
 
@@ -336,50 +345,25 @@ def list_user_books(
         return [dict(r) for r in cur.fetchall()]
 
 
-def update_user_book_status(
-    discord_user_id: str,
-    book_id: int,
-    status: str,
-    db_path: str = DEFAULT_DB_PATH,
-) -> None:
-    status = status.strip().lower()
-    if status not in ALLOWED_STATUSES:
-        raise ValueError(f"Invalid status '{status}'. Allowed: {sorted(ALLOWED_STATUSES)}")
-
-    now = utc_now_iso()
+def get_user_book_link(discord_user_id: str, book_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
     user = get_user(discord_user_id, db_path=db_path)
     if not user:
-        raise ValueError("User not found.")
+        return None
     user_id = int(user["id"])
-
-    started_at = now if status == "reading" else None
-    finished_at = now if status == "finished" else None
-
     with get_conn(db_path) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
         row = conn.execute(
-            "SELECT started_at, finished_at FROM user_books WHERE user_id=? AND book_id=?;",
-            (user_id, book_id),
-        ).fetchone()
-        if not row:
-            raise ValueError("This book is not linked to the user.")
-
-        if row["started_at"] and started_at:
-            started_at = row["started_at"]
-        if row["finished_at"] and finished_at:
-            finished_at = row["finished_at"]
-
-        conn.execute(
             """
-            UPDATE user_books
-            SET status = ?,
-                started_at = COALESCE(?, started_at),
-                finished_at = COALESCE(?, finished_at),
-                updated_at = ?
-            WHERE user_id = ? AND book_id = ?;
+            SELECT
+              ub.book_id, ub.status, ub.progress_pct, ub.current_page, ub.total_pages,
+              ub.started_at, ub.finished_at, ub.last_milestone, ub.updated_at,
+              b.title, b.author
+            FROM user_books ub
+            JOIN books b ON b.id = ub.book_id
+            WHERE ub.user_id=? AND ub.book_id=?;
             """,
-            (status, started_at, finished_at, now, user_id, book_id),
-        )
+            (user_id, int(book_id)),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def update_user_book_progress(
@@ -394,22 +378,21 @@ def update_user_book_progress(
     if not user:
         raise ValueError("User not found.")
     user_id = int(user["id"])
-
     now = utc_now_iso()
 
+    # derive percent if possible
     if progress_pct is None and current_page is not None and total_pages:
         if total_pages <= 0:
-            raise ValueError("total_pages must be > 0.")
+            raise ValueError("total_pages must be > 0")
         progress_pct = int(round((current_page / total_pages) * 100))
 
     if progress_pct is not None:
         progress_pct = max(0, min(100, int(progress_pct)))
 
     with get_conn(db_path) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
         exists = conn.execute(
             "SELECT id FROM user_books WHERE user_id=? AND book_id=?;",
-            (user_id, book_id),
+            (user_id, int(book_id)),
         ).fetchone()
         if not exists:
             raise ValueError("This book is not linked to the user.")
@@ -423,67 +406,54 @@ def update_user_book_progress(
                 updated_at = ?
             WHERE user_id = ? AND book_id = ?;
             """,
-            (progress_pct, current_page, total_pages, now, user_id, book_id),
+            (progress_pct, current_page, total_pages, now, user_id, int(book_id)),
         )
 
 
-def get_user_profile_summary(discord_user_id: str, db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
+def update_user_book_status(
+    discord_user_id: str,
+    book_id: int,
+    status: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    status = status.strip().lower()
+    if status not in ALLOWED_STATUSES:
+        raise ValueError(f"Invalid status '{status}'")
+
     user = get_user(discord_user_id, db_path=db_path)
     if not user:
-        return {
-            "exists": False,
-            "discord_user_id": discord_user_id,
-            "goodreads_url": None,
-            "counts": {s: 0 for s in ALLOWED_STATUSES},
-        }
-
+        raise ValueError("User not found.")
     user_id = int(user["id"])
-    counts = {s: 0 for s in ALLOWED_STATUSES}
+    now = utc_now_iso()
 
-    with get_conn(db_path) as conn:
-        cur = conn.execute(
-            """
-            SELECT status, COUNT(*) AS c
-            FROM user_books
-            WHERE user_id = ?
-            GROUP BY status;
-            """,
-            (user_id,),
-        )
-        for row in cur.fetchall():
-            st = row["status"]
-            if st in counts:
-                counts[st] = int(row["c"])
+    started_at = now if status == STATUS_READING else None
+    finished_at = now if status == STATUS_FINISHED else None
 
-    return {
-        "exists": True,
-        "discord_user_id": discord_user_id,
-        "display_name": user.get("display_name"),
-        "goodreads_url": user.get("goodreads_url"),
-        "counts": counts,
-    }
-
-
-# --------------------------
-# Milestones helpers
-# --------------------------
-
-def get_user_book_link(discord_user_id: str, book_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
-    user = get_user(discord_user_id, db_path=db_path)
-    if not user:
-        return None
-    user_id = int(user["id"])
     with get_conn(db_path) as conn:
         row = conn.execute(
-            """
-            SELECT ub.*, b.title, b.author
-            FROM user_books ub
-            JOIN books b ON b.id = ub.book_id
-            WHERE ub.user_id = ? AND ub.book_id = ?;
-            """,
-            (user_id, book_id),
+            "SELECT started_at, finished_at FROM user_books WHERE user_id=? AND book_id=?;",
+            (user_id, int(book_id)),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            raise ValueError("This book is not linked to the user.")
+
+        # preserve existing timestamps if already set
+        if row["started_at"] and started_at:
+            started_at = row["started_at"]
+        if row["finished_at"] and finished_at:
+            finished_at = row["finished_at"]
+
+        conn.execute(
+            """
+            UPDATE user_books
+            SET status=?,
+                started_at=COALESCE(?, started_at),
+                finished_at=COALESCE(?, finished_at),
+                updated_at=?
+            WHERE user_id=? AND book_id=?;
+            """,
+            (status, started_at, finished_at, now, user_id, int(book_id)),
+        )
 
 
 def set_last_milestone(discord_user_id: str, book_id: int, milestone: int, db_path: str = DEFAULT_DB_PATH) -> None:
@@ -491,12 +461,138 @@ def set_last_milestone(discord_user_id: str, book_id: int, milestone: int, db_pa
     if not user:
         return
     user_id = int(user["id"])
+    now = utc_now_iso()
     with get_conn(db_path) as conn:
         conn.execute(
             """
             UPDATE user_books
-            SET last_milestone = ?, updated_at = ?
-            WHERE user_id = ? AND book_id = ?;
+            SET last_milestone=?, updated_at=?
+            WHERE user_id=? AND book_id=?;
             """,
-            (int(milestone), utc_now_iso(), user_id, int(book_id)),
+            (int(milestone), now, user_id, int(book_id)),
         )
+
+
+def get_user_profile_summary(discord_user_id: str, db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
+    user = get_user(discord_user_id, db_path=db_path)
+    if not user:
+        return {"exists": False, "goodreads_url": None}
+
+    counts = {s: 0 for s in ALLOWED_STATUSES}
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT status, COUNT(*) AS c
+            FROM user_books ub
+            JOIN users u ON u.id = ub.user_id
+            WHERE u.discord_user_id = ?
+            GROUP BY status;
+            """,
+            (discord_user_id,),
+        )
+        for r in cur.fetchall():
+            if r["status"] in counts:
+                counts[r["status"]] = int(r["c"])
+
+    return {
+        "exists": True,
+        "goodreads_url": user.get("goodreads_url"),
+        "display_name": user.get("display_name"),
+        "counts": counts,
+    }
+
+
+def get_last_finished(discord_user_id: str, limit: int = 3, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    user = get_user(discord_user_id, db_path=db_path)
+    if not user:
+        return []
+    user_id = int(user["id"])
+
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT b.title, b.author, ub.finished_at
+            FROM user_books ub
+            JOIN books b ON b.id = ub.book_id
+            WHERE ub.user_id=? AND ub.status=?
+            ORDER BY ub.finished_at DESC, ub.updated_at DESC
+            LIMIT ?;
+            """,
+            (user_id, STATUS_FINISHED, int(limit)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_recent_reading_updates(limit: int = 5, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """
+    Returns up to N most-recent (unique) users who updated a reading book.
+    """
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT
+              u.discord_user_id,
+              u.display_name,
+              b.title,
+              b.author,
+              ub.progress_pct,
+              ub.updated_at
+            FROM user_books ub
+            JOIN users u ON u.id = ub.user_id
+            JOIN books b ON b.id = ub.book_id
+            WHERE ub.status = ?
+            ORDER BY ub.updated_at DESC
+            LIMIT 50;
+            """,
+            (STATUS_READING,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        uid = r["discord_user_id"]
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def get_recent_finishes(limit: int = 5, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """
+    Returns up to N most-recent (unique) users who finished a book.
+    """
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT
+              u.discord_user_id,
+              u.display_name,
+              b.title,
+              b.author,
+              ub.finished_at
+            FROM user_books ub
+            JOIN users u ON u.id = ub.user_id
+            JOIN books b ON b.id = ub.book_id
+            WHERE ub.status = ? AND ub.finished_at IS NOT NULL
+            ORDER BY ub.finished_at DESC
+            LIMIT 50;
+            """,
+            (STATUS_FINISHED,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        uid = r["discord_user_id"]
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out

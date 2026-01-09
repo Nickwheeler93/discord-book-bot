@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -17,138 +18,181 @@ from database import (
     update_user_book_status,
     get_user_book_link,
     set_last_milestone,
+    get_last_finished,
+    get_recent_reading_updates,
+    get_recent_finishes,
+    STATUS_READING,
+    STATUS_FINISHED,
     MILESTONES,
 )
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# Channels
+WELCOME_CHANNEL_ID = 1457524496406806675          # welcome channel (also used for "I'm alive")
+MILESTONE_CHANNEL_ID = 1455707887321088132        # milestones congrats channel
+
+# Logging to mounted logs directory
 os.makedirs("./logs", exist_ok=True)
 handler = logging.FileHandler(filename="./logs/discord.log", encoding="utf-8", mode="a")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-WELCOME_CHANNEL_ID = 1457524496406806675 # set to where you waelcome messages
-MILESTONE_CHANNEL_ID = 1455707887321088132 # set to where you want congratulations messages
-
-
-# per-user cache of last Google Books search results
-# { discord_user_id(str): [ {title, authors, volume_id, published_year, isbn13}, ... ] }
+# Per-user last search cache for Google Books
+# {discord_user_id: [ {title, author, volume_id, published_year, isbn13, page_count}, ... ]}
 LAST_SEARCH: dict[str, list[dict]] = {}
 
 
 def ensure_user(ctx: commands.Context) -> None:
-    upsert_user(
-        discord_user_id=str(ctx.author.id),
-        display_name=ctx.author.display_name,
-        db_path=DEFAULT_DB_PATH,
-    )
+    upsert_user(str(ctx.author.id), display_name=ctx.author.display_name, db_path=DEFAULT_DB_PATH)
 
 
-def format_reading_index_list(books: list[dict]) -> str:
+def format_reading_list(reading: list[dict]) -> str:
     lines = []
-    for i, b in enumerate(books, start=1):
+    for i, b in enumerate(reading, start=1):
         title = b.get("title") or "Untitled"
         author = b.get("author") or "Unknown author"
         pct = b.get("progress_pct", 0)
-        lines.append(f"{i}. **{title}** — {author} ({pct}%)")
+
+        cp = b.get("current_page")
+        tp = b.get("total_pages")
+        if cp is not None and tp:
+            extra = f"{cp}/{tp} ({pct}%)"
+        elif tp and pct is not None:
+            extra = f"{pct}% (total {tp})"
+        elif cp is not None:
+            extra = f"page {cp}"
+        else:
+            extra = f"{pct}%"
+
+        lines.append(f"{i}. **{title}** — {author} • {extra}")
     return "\n".join(lines)
 
 
-def resolve_book_from_arg(discord_user_id: str, arg: str | None, status_scope: str = "reading") -> int | None:
+def parse_progress_value(value: str) -> dict:
     """
-    Resolve a book_id from either:
-    - numeric index (1-based) into user's books with given status_scope
-    - title substring match (best-effort) within that scope, fallback to all statuses
-    If arg is None, returns None.
+    Accepts:
+      - '120' (page)
+      - '45%' (percent)
+      - '120/500' (page/total)
+    Returns dict with keys among: current_page, total_pages, progress_pct
     """
-    if not arg:
+    v = value.strip()
+
+    # percent
+    if v.endswith("%"):
+        pct = int(v[:-1].strip())
+        return {"progress_pct": max(0, min(100, pct))}
+
+    # fraction pages
+    if "/" in v:
+        a, b = v.split("/", 1)
+        current_page = int(a.strip())
+        total_pages = int(b.strip())
+        if total_pages <= 0:
+            raise ValueError("total pages must be > 0")
+        pct = int(round((current_page / total_pages) * 100))
+        return {
+            "current_page": current_page,
+            "total_pages": total_pages,
+            "progress_pct": max(0, min(100, pct)),
+        }
+
+    # raw page number
+    return {"current_page": int(v)}
+
+
+def resolve_reading_book_id(discord_user_id: str, which: str | None) -> int | None:
+    """
+    Resolution rules:
+    - if user has 1 reading book -> caller shouldn't use this, just pick it
+    - if multiple:
+        - which is digit -> index into reading list (1-based)
+        - else -> substring match on title (case-insensitive)
+    """
+    reading = list_user_books(discord_user_id, status=STATUS_READING, db_path=DEFAULT_DB_PATH, limit=200)
+    if not reading:
         return None
 
-    arg = arg.strip()
-    scoped = list_user_books(discord_user_id, status=status_scope, db_path=DEFAULT_DB_PATH, limit=200)
+    if len(reading) == 1:
+        return int(reading[0]["book_id"])
 
-    # index
-    if arg.isdigit():
-        idx = int(arg)
-        if 1 <= idx <= len(scoped):
-            return int(scoped[idx - 1]["book_id"])
+    if not which:
         return None
 
-    q = arg.lower()
+    w = which.strip()
 
-    # exact-ish match within scope
-    for b in scoped:
+    if w.isdigit():
+        idx = int(w)
+        if 1 <= idx <= len(reading):
+            return int(reading[idx - 1]["book_id"])
+        return None
+
+    q = w.lower()
+    # exact match
+    for b in reading:
         if (b.get("title") or "").strip().lower() == q:
             return int(b["book_id"])
-
-    # contains match within scope
-    for b in scoped:
-        if q in ((b.get("title") or "").lower()):
-            return int(b["book_id"])
-
-    # fallback: search all user books
-    allb = list_user_books(discord_user_id, db_path=DEFAULT_DB_PATH, limit=200)
-    for b in allb:
+    # substring match
+    for b in reading:
         if q in ((b.get("title") or "").lower()):
             return int(b["book_id"])
 
     return None
 
 
-async def google_books_search(query: str, limit: int = 5) -> list[dict]:
+async def google_books_search(query: str, limit: int = 3) -> list[dict]:
     """
-    Uses Google Books public volumes endpoint (no key required for basic usage).
-    Returns list of dicts with title/authors/volume_id/year/isbn13.
+    Uses public Google Books volumes API.
     """
-    q = query.strip()
     url = "https://www.googleapis.com/books/v1/volumes"
-    params = {"q": q, "maxResults": str(max(1, min(10, limit)))}
+    params = {"q": query.strip(), "maxResults": str(max(1, min(10, limit)))}
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params, timeout=15) as resp:
             resp.raise_for_status()
             data = await resp.json()
 
-    out = []
-    for item in data.get("items", [])[:limit]:
+    results: list[dict] = []
+    for item in (data.get("items") or [])[:limit]:
         volume_id = item.get("id")
-        info = item.get("volumeInfo", {}) or {}
+        info = item.get("volumeInfo") or {}
+
         title = info.get("title") or "Untitled"
         authors = info.get("authors") or []
-        published = info.get("publishedDate") or ""
-        year = None
-        if len(published) >= 4 and published[:4].isdigit():
-            year = int(published[:4])
+        author = ", ".join(authors) if authors else None
 
-        # try to pull isbn13
+        published = info.get("publishedDate") or ""
+        year = int(published[:4]) if len(published) >= 4 and published[:4].isdigit() else None
+
         isbn13 = None
-        for ident in info.get("industryIdentifiers", []) or []:
+        for ident in (info.get("industryIdentifiers") or []):
             if ident.get("type") == "ISBN_13":
                 isbn13 = ident.get("identifier")
                 break
 
-        out.append(
+        page_count = info.get("pageCount")  # may be None
+
+        results.append(
             {
                 "title": title,
-                "authors": ", ".join(authors) if authors else None,
+                "author": author,
                 "volume_id": volume_id,
                 "published_year": year,
                 "isbn13": isbn13,
+                "page_count": page_count,
             }
         )
-    return out
+
+    return results
 
 
-async def maybe_announce_milestone(ctx: commands.Context, book_id: int) -> None:
-    """
-    After a progress update, check if milestone crossed; if so, announce and persist last_milestone.
-    """
-    link = get_user_book_link(str(ctx.author.id), book_id, db_path=DEFAULT_DB_PATH)
+async def announce_milestone_if_crossed(discord_user_id: str, book_id: int) -> None:
+    link = get_user_book_link(discord_user_id, book_id, db_path=DEFAULT_DB_PATH)
     if not link:
         return
 
@@ -160,16 +204,24 @@ async def maybe_announce_milestone(ctx: commands.Context, book_id: int) -> None:
         return
 
     new_last = max(crossed)
-    set_last_milestone(str(ctx.author.id), book_id, new_last, db_path=DEFAULT_DB_PATH)
+    set_last_milestone(discord_user_id, book_id, new_last, db_path=DEFAULT_DB_PATH)
 
-    title = link.get("title") or "that book"
-    await ctx.send(f"🏁 Milestone! **{title}** just hit **{new_last}%** 🎉")
+    channel = bot.get_channel(MILESTONE_CHANNEL_ID)
+    if not channel:
+        return
+
+    title = link.get("title") or "your book"
+    await channel.send(f"🎉 <@{discord_user_id}> just hit **{new_last}%** on **{title}**! Keep going 💪📚")
 
 
 @bot.event
 async def on_ready():
     init_db(DEFAULT_DB_PATH)
-    print("we are ready to go!")
+    print("im ready!")
+
+    channel = bot.get_channel(WELCOME_CHANNEL_ID)
+    if channel:
+        await channel.send("✅ I’m alive and online!")
 
 
 @bot.event
@@ -179,59 +231,102 @@ async def on_member_join(member: discord.Member):
         await channel.send(f"Welcome to the Book Club, {member.mention}! 👋")
 
 
-# ----------------
+# -----------------------
 # Commands
-# ----------------
+# -----------------------
 
 @bot.command()
 async def setgoodreads(ctx, *, url: str):
     ensure_user(ctx)
     set_goodreads_url(str(ctx.author.id), url.strip(), db_path=DEFAULT_DB_PATH)
-    await ctx.send("🔗 Saved your Goodreads URL! It’ll show up in `!profile`.")
+    await ctx.send("🔗 Saved! Your Goodreads URL will show in `!profile`.")
 
 
 @bot.command()
 async def profile(ctx):
     ensure_user(ctx)
+
     summary = get_user_profile_summary(str(ctx.author.id), db_path=DEFAULT_DB_PATH)
-    counts = summary["counts"]
     goodreads = summary.get("goodreads_url") or "Not set"
+
+    reading = list_user_books(str(ctx.author.id), status=STATUS_READING, db_path=DEFAULT_DB_PATH, limit=10)
+    finished = get_last_finished(str(ctx.author.id), limit=3, db_path=DEFAULT_DB_PATH)
+
+    reading_part = "None"
+    if reading:
+        # show up to 3 current reading
+        lines = []
+        for b in reading[:3]:
+            title = b.get("title") or "Untitled"
+            pct = b.get("progress_pct", 0)
+            lines.append(f"- **{title}** ({pct}%)")
+        reading_part = "\n".join(lines)
+
+    finished_part = "None"
+    if finished:
+        lines = []
+        for b in finished:
+            t = b.get("title") or "Untitled"
+            a = b.get("author") or "Unknown author"
+            lines.append(f"- **{t}** — {a}")
+        finished_part = "\n".join(lines)
 
     await ctx.send(
         f"👤 **{ctx.author.display_name}**\n"
-        f"🔗 Goodreads: {goodreads}\n"
-        f"📚 Plan: **{counts.get('plan_to_read', 0)}** | "
-        f"Reading: **{counts.get('reading', 0)}** | "
-        f"Finished: **{counts.get('finished', 0)}** | "
-        f"DNF: **{counts.get('dnf', 0)}** | "
-        f"Paused: **{counts.get('paused', 0)}**"
+        f"🔗 Goodreads: {goodreads}\n\n"
+        f"📖 **Currently reading:**\n{reading_part}\n\n"
+        f"✅ **Last 3 finished:**\n{finished_part}"
     )
 
 
 @bot.command()
-async def list(ctx, status: str = None):
+async def mybooks(ctx):
     ensure_user(ctx)
-    books = list_user_books(str(ctx.author.id), status=status, db_path=DEFAULT_DB_PATH, limit=50)
-    if not books:
-        await ctx.send("No books found for that filter.")
+    reading = list_user_books(str(ctx.author.id), status=STATUS_READING, db_path=DEFAULT_DB_PATH, limit=50)
+    if not reading:
+        await ctx.send("You’re not tracking any books right now. Use `!startbook <title>`.")
         return
-
-    lines = []
-    for i, b in enumerate(books, start=1):
-        title = b.get("title") or "Untitled"
-        author = b.get("author") or "Unknown author"
-        st = b.get("status")
-        pct = b.get("progress_pct", 0)
-        lines.append(f"{i}. **{title}** — {author} [{st}] ({pct}%)")
-
-    await ctx.send("📚 Your books:\n" + "\n".join(lines[:25]))
+    await ctx.send("📚 **Currently reading:**\n" + format_reading_list(reading))
 
 
 @bot.command()
-async def search(ctx, *, query: str):
+async def currentlyreading(ctx):
+    rows = get_recent_reading_updates(limit=5, db_path=DEFAULT_DB_PATH)
+    if not rows:
+        await ctx.send("No recent reading updates yet.")
+        return
+
+    lines = []
+    for r in rows:
+        name = r.get("display_name") or "Unknown"
+        title = r.get("title") or "Untitled"
+        author = r.get("author") or "Unknown author"
+        pct = r.get("progress_pct", 0)
+        lines.append(f"- **{name}** → **{title}** — {author} ({pct}%)")
+    await ctx.send("🕒 **Recent reading updates:**\n" + "\n".join(lines))
+
+
+@bot.command()
+async def finishedbooks(ctx):
+    rows = get_recent_finishes(limit=5, db_path=DEFAULT_DB_PATH)
+    if not rows:
+        await ctx.send("No recent finishes yet.")
+        return
+
+    lines = []
+    for r in rows:
+        name = r.get("display_name") or "Unknown"
+        title = r.get("title") or "Untitled"
+        author = r.get("author") or "Unknown author"
+        lines.append(f"- **{name}** finished **{title}** — {author}")
+    await ctx.send("🏁 **Recent finishes:**\n" + "\n".join(lines))
+
+
+@bot.command()
+async def searchbook(ctx, *, query: str):
     ensure_user(ctx)
 
-    results = await google_books_search(query, limit=5)
+    results = await google_books_search(query, limit=3)
     if not results:
         await ctx.send("No results found.")
         return
@@ -241,33 +336,25 @@ async def search(ctx, *, query: str):
     lines = []
     for i, r in enumerate(results, start=1):
         t = r["title"]
-        a = r["authors"] or "Unknown author"
+        a = r.get("author") or "Unknown author"
         y = f" ({r['published_year']})" if r.get("published_year") else ""
-        lines.append(f"{i}. **{t}** — {a}{y}")
+        pages = f" — {r['page_count']} pages" if r.get("page_count") else ""
+        lines.append(f"{i}. **{t}** — {a}{y}{pages}")
 
     await ctx.send(
-        "🔎 Google Books results:\n"
+        "🔎 **Top results:**\n"
         + "\n".join(lines)
-        + "\n\nUse: `!addbook <index> [plan|reading|finished|dnf|paused]`"
+        + "\n\nUse `!addbook <index>` to add it to your currently reading."
     )
 
 
 @bot.command()
-async def addbook(ctx, index: int, status: str = "plan_to_read"):
-    """
-    Add a book from your last !search results.
-    Usage: !addbook 2 reading
-    """
+async def addbook(ctx, index: int):
     ensure_user(ctx)
-
-    status = status.strip().lower()
-    # normalize common short forms
-    if status == "plan":
-        status = "plan_to_read"
 
     results = LAST_SEARCH.get(str(ctx.author.id)) or []
     if not results:
-        await ctx.send("Run `!search <query>` first.")
+        await ctx.send("Run `!searchbook <query>` or `!startbook <title>` first.")
         return
 
     if not (1 <= index <= len(results)):
@@ -276,17 +363,19 @@ async def addbook(ctx, index: int, status: str = "plan_to_read"):
 
     r = results[index - 1]
     title = r["title"]
-    author = r.get("authors")
+    author = r.get("author")
     volume_id = r.get("volume_id")
     year = r.get("published_year")
     isbn13 = r.get("isbn13")
+    page_count = r.get("page_count")
 
-    _, book_id, created = add_book_to_user(
+    _, _, created = add_book_to_user(
         discord_user_id=str(ctx.author.id),
         title=title,
         author=author,
-        status=status,
+        status=STATUS_READING,
         progress_pct=0,
+        total_pages=page_count if isinstance(page_count, int) else None,
         google_volume_id=volume_id,
         isbn13=isbn13,
         published_year=year,
@@ -294,187 +383,191 @@ async def addbook(ctx, index: int, status: str = "plan_to_read"):
     )
 
     if created:
-        await ctx.send(f"✅ Added **{title}** ({status})")
+        extra = f" (total pages: {page_count})" if page_count else ""
+        await ctx.send(f"✅ Added **{title}** to currently reading{extra}.")
     else:
-        await ctx.send(f"♻️ You already had **{title}** — I updated it to **{status}**.")
-
-    # if they add as reading, it becomes the "active reading" list; progress commands will disambiguate if multiple.
+        await ctx.send(f"♻️ **{title}** was already on your list — set to currently reading.")
 
 
 @bot.command()
-async def startbook(ctx, *, title: str):
+async def startbook(ctx, *, query: str):
     """
-    Convenience: start reading a book by title (creates a local book record if needed).
-    """
-    ensure_user(ctx)
-    _, _, created = add_book_to_user(
-        discord_user_id=str(ctx.author.id),
-        title=title,
-        author=None,
-        status="reading",
-        progress_pct=0,
-        db_path=DEFAULT_DB_PATH,
-    )
-    if created:
-        await ctx.send(f"📖 Started **{title}** (reading).")
-    else:
-        await ctx.send(f"📖 Set **{title}** to **reading**.")
-
-
-@bot.command()
-async def totalpages(ctx, total_pages: int, *, which: str = None):
-    """
-    Set total pages for a reading book.
-
-    If multiple reading books and you don't specify which, bot replies with an index list.
-    Usage:
-      !totalpages 500
-      !totalpages 500 2
-      !totalpages 500 dune
+    Searches Google Books and shows top 3 for user to choose.
+    Manual fallback supported by using a delimiter:
+      !startbook Title Here | 500
+    If Google finds nothing but you provided '| totalpages', it creates the book manually.
     """
     ensure_user(ctx)
 
-    reading = list_user_books(str(ctx.author.id), status="reading", db_path=DEFAULT_DB_PATH, limit=200)
-    if not reading:
-        await ctx.send("No active reading books. Use `!startbook <title>` or `!addbook <index> reading`.")
-        return
+    # Manual fallback: "title | pages"
+    title = query.strip()
+    manual_pages = None
+    if "|" in title:
+        left, right = title.split("|", 1)
+        title = left.strip()
+        right = right.strip()
+        if right.isdigit():
+            manual_pages = int(right)
 
-    if len(reading) > 1 and not which:
+    results = await google_books_search(title, limit=3)
+    if results:
+        LAST_SEARCH[str(ctx.author.id)] = results
+
+        lines = []
+        for i, r in enumerate(results, start=1):
+            t = r["title"]
+            a = r.get("author") or "Unknown author"
+            y = f" ({r['published_year']})" if r.get("published_year") else ""
+            pages = f" — {r['page_count']} pages" if r.get("page_count") else ""
+            lines.append(f"{i}. **{t}** — {a}{y}{pages}")
+
         await ctx.send(
-            "You have multiple books marked **reading**. Reply with an index:\n"
-            + format_reading_index_list(reading)
-            + "\n\nExample: `!totalpages 500 2`"
+            "📖 **Pick one:**\n"
+            + "\n".join(lines)
+            + "\n\nUse `!addbook <index>` to add it to your currently reading."
         )
         return
 
-    book_id = resolve_book_from_arg(str(ctx.author.id), which or "1", status_scope="reading") if len(reading) > 1 else int(reading[0]["book_id"])
-    if not book_id:
-        await ctx.send("Couldn't resolve that book. Try an index from the list or a clearer title.")
+    # No results: if they provided manual pages, create manually
+    if manual_pages is not None:
+        _, _, created = add_book_to_user(
+            discord_user_id=str(ctx.author.id),
+            title=title,
+            author=None,
+            status=STATUS_READING,
+            progress_pct=0,
+            total_pages=manual_pages,
+            db_path=DEFAULT_DB_PATH,
+        )
+        if created:
+            await ctx.send(f"✅ Couldn’t find it on Google Books — created **{title}** ({manual_pages} pages) and started it.")
+        else:
+            await ctx.send(f"♻️ **{title}** already existed — set to currently reading and total pages updated if needed.")
         return
 
-    update_user_book_progress(
-        discord_user_id=str(ctx.author.id),
-        book_id=book_id,
-        total_pages=total_pages,
-        db_path=DEFAULT_DB_PATH,
-    )
-    await ctx.send(f"📏 Set total pages to **{total_pages}**")
+    await ctx.send("No Google Books results. If you want to add manually, use: `!startbook Title | 500`")
 
 
 @bot.command()
-async def progress(ctx, page: int, *, which: str = None):
+async def progress(ctx, value: str, *, which: str = None):
     """
-    Update current page for a reading book.
+    Update progress for currently reading book(s).
+
+    If multiple reading books and no 'which' provided -> returns indexed list.
     Usage:
       !progress 120
+      !progress 45%
+      !progress 120/500
       !progress 120 2
-      !progress 120 dune
+      !progress 45% dune
     """
     ensure_user(ctx)
 
-    reading = list_user_books(str(ctx.author.id), status="reading", db_path=DEFAULT_DB_PATH, limit=200)
+    reading = list_user_books(str(ctx.author.id), status=STATUS_READING, db_path=DEFAULT_DB_PATH, limit=200)
     if not reading:
-        await ctx.send("No active reading books. Use `!startbook <title>` first.")
+        await ctx.send("You don’t have any active reading books. Use `!startbook <title>`.")
         return
 
     if len(reading) > 1 and not which:
         await ctx.send(
-            "You have multiple books marked **reading**. Reply with an index or title:\n"
-            + format_reading_index_list(reading)
-            + "\n\nExample: `!progress 120 2` or `!progress 120 dune`"
+            "You have multiple books marked **currently reading**. Reply with an index or title:\n"
+            + format_reading_list(reading)
+            + "\n\nExample: `!progress 120 2` or `!progress 45% dune`"
         )
         return
 
-    book_id = resolve_book_from_arg(str(ctx.author.id), which or "1", status_scope="reading") if len(reading) > 1 else int(reading[0]["book_id"])
+    book_id = resolve_reading_book_id(str(ctx.author.id), which)
     if not book_id:
-        await ctx.send("Couldn't resolve that book. Try an index from the list or a clearer title.")
+        await ctx.send("Couldn’t resolve that book. Try an index from the list or a clearer title.")
+        return
+
+    # Parse and compute missing fields where possible
+    try:
+        payload = parse_progress_value(value)
+    except Exception as e:
+        await ctx.send(f"Bad progress value. Try `120`, `45%`, or `120/500`. ({e})")
+        return
+
+    link = get_user_book_link(str(ctx.author.id), book_id, db_path=DEFAULT_DB_PATH)
+    if not link:
+        await ctx.send("Internal error: couldn’t load book link.")
+        return
+
+    # If user gives percent but we have total_pages and no current_page -> derive current_page
+    if "progress_pct" in payload and "current_page" not in payload:
+        tp = payload.get("total_pages") or link.get("total_pages")
+        if tp:
+            payload["current_page"] = int(round((payload["progress_pct"] / 100) * tp))
+        else:
+            # can't infer page without total pages
+            pass
+
+    # If user gives current_page and we have total_pages and percent not provided -> derive percent
+    if "current_page" in payload and "progress_pct" not in payload:
+        tp = payload.get("total_pages") or link.get("total_pages")
+        if tp:
+            payload["progress_pct"] = max(0, min(100, int(round((payload["current_page"] / tp) * 100))))
+
+    # If they gave percent but we still have no total_pages and no current_page derivation possible
+    if "progress_pct" in payload and link.get("total_pages") is None and payload.get("total_pages") is None and "current_page" not in payload:
+        await ctx.send("I need total pages to translate percent into pages. Set it with: `!startbook Title | 500` (or use `120/500`).")
+        # still allow storing percent alone
+        update_user_book_progress(str(ctx.author.id), book_id, progress_pct=payload["progress_pct"], db_path=DEFAULT_DB_PATH)
+        await announce_milestone_if_crossed(str(ctx.author.id), book_id)
         return
 
     update_user_book_progress(
-        discord_user_id=str(ctx.author.id),
-        book_id=book_id,
-        current_page=page,
+        str(ctx.author.id),
+        book_id,
+        progress_pct=payload.get("progress_pct"),
+        current_page=payload.get("current_page"),
+        total_pages=payload.get("total_pages"),
         db_path=DEFAULT_DB_PATH,
     )
-    await ctx.send(f"✅ Updated progress to page **{page}**")
-    await maybe_announce_milestone(ctx, book_id)
+
+    await ctx.send("✅ Progress updated.")
+    await announce_milestone_if_crossed(str(ctx.author.id), book_id)
 
 
-@bot.command()
-async def progresspct(ctx, percent: int, *, which: str = None):
+@bot.command(name="finish", aliases=["finishbook"])
+async def finish_book(ctx, *, which: str = None):
     """
-    Update percent progress for a reading book.
-    Usage:
-      !progresspct 45
-      !progresspct 45 2
-      !progresspct 45 dune
+    Mark a currently reading book as finished.
+    If multiple reading books and no identifier -> returns indexed list.
     """
     ensure_user(ctx)
 
-    reading = list_user_books(str(ctx.author.id), status="reading", db_path=DEFAULT_DB_PATH, limit=200)
+    reading = list_user_books(str(ctx.author.id), status=STATUS_READING, db_path=DEFAULT_DB_PATH, limit=200)
     if not reading:
-        await ctx.send("No active reading books. Use `!startbook <title>` first.")
+        await ctx.send("You don’t have any active reading books to finish.")
         return
 
     if len(reading) > 1 and not which:
         await ctx.send(
-            "You have multiple books marked **reading**. Reply with an index or title:\n"
-            + format_reading_index_list(reading)
-            + "\n\nExample: `!progresspct 45 2` or `!progresspct 45 dune`"
-        )
-        return
-
-    book_id = resolve_book_from_arg(str(ctx.author.id), which or "1", status_scope="reading") if len(reading) > 1 else int(reading[0]["book_id"])
-    if not book_id:
-        await ctx.send("Couldn't resolve that book. Try an index from the list or a clearer title.")
-        return
-
-    pct = max(0, min(100, int(percent)))
-    update_user_book_progress(
-        discord_user_id=str(ctx.author.id),
-        book_id=book_id,
-        progress_pct=pct,
-        db_path=DEFAULT_DB_PATH,
-    )
-    await ctx.send(f"✅ Updated progress to **{pct}%**")
-    await maybe_announce_milestone(ctx, book_id)
-
-
-@bot.command()
-async def finish(ctx, *, which: str = None):
-    """
-    Mark a book finished.
-    If multiple reading books and no 'which', reply with index list.
-    Usage:
-      !finish
-      !finish 2
-      !finish dune
-    """
-    ensure_user(ctx)
-
-    reading = list_user_books(str(ctx.author.id), status="reading", db_path=DEFAULT_DB_PATH, limit=200)
-    if not reading:
-        await ctx.send("No active reading books to finish.")
-        return
-
-    if len(reading) > 1 and not which:
-        await ctx.send(
-            "You have multiple books marked **reading**. Reply with an index or title:\n"
-            + format_reading_index_list(reading)
+            "You have multiple books marked **currently reading**. Reply with an index or title:\n"
+            + format_reading_list(reading)
             + "\n\nExample: `!finish 2` or `!finish dune`"
         )
         return
 
-    book_id = resolve_book_from_arg(str(ctx.author.id), which or "1", status_scope="reading") if len(reading) > 1 else int(reading[0]["book_id"])
+    book_id = resolve_reading_book_id(str(ctx.author.id), which)
     if not book_id:
-        await ctx.send("Couldn't resolve that book. Try an index from the list or a clearer title.")
+        await ctx.send("Couldn’t resolve that book. Try an index from the list or a clearer title.")
         return
 
-    update_user_book_progress(str(ctx.author.id), book_id, progress_pct=100, db_path=DEFAULT_DB_PATH)
-    update_user_book_status(str(ctx.author.id), book_id, status="finished", db_path=DEFAULT_DB_PATH)
+    # Snap to 100% if we can
+    link = get_user_book_link(str(ctx.author.id), book_id, db_path=DEFAULT_DB_PATH)
+    tp = link.get("total_pages") if link else None
+    cp = link.get("current_page") if link else None
+    if tp and (cp is None or cp < tp):
+        update_user_book_progress(str(ctx.author.id), book_id, current_page=tp, progress_pct=100, db_path=DEFAULT_DB_PATH)
+    else:
+        update_user_book_progress(str(ctx.author.id), book_id, progress_pct=100, db_path=DEFAULT_DB_PATH)
+
+    update_user_book_status(str(ctx.author.id), book_id, status=STATUS_FINISHED, db_path=DEFAULT_DB_PATH)
 
     await ctx.send("🎉 Marked as **finished**!")
-    await maybe_announce_milestone(ctx, book_id)
+    await announce_milestone_if_crossed(str(ctx.author.id), book_id)
 
 
 if __name__ == "__main__":
